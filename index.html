@@ -785,6 +785,18 @@
     out.habits     = mergeHabits(L.habits,   remote.habits);
     out.mediaItems = mergeById(L.mediaItems, remote.mediaItems);
     out.notes      = mergeById(L.notes,      remote.notes);
+    // 合并删除墓碑：任一方删过的 id，合并后都不再出现（解决跨设备/离线删除被「重新拉回」）
+    var deleted = {};
+    (L.deletedIds||[]).forEach(function(x){ if(typeof x==='string') deleted[x]=1; });
+    (remote.deletedIds||[]).forEach(function(x){ if(typeof x==='string') deleted[x]=1; });
+    var deletedKeys = Object.keys(deleted);
+    if(deletedKeys.length){
+      out.records = out.records.filter(function(r){ return r && !deleted[r.id]; });
+      out.mediaItems = out.mediaItems.filter(function(m){ return m && !deleted[m.id]; });
+      out.notes = out.notes.filter(function(n){ return n && !deleted[n.id]; });
+      out.habits = out.habits.filter(function(h){ return h && !deleted[h.id]; });
+    }
+    out.deletedIds = deletedKeys;
     var ls = L.settings || {}, rs = remote.settings || {};
     out.settings = Object.assign({}, rs, ls);
     out.settings.weeklyPlan = mergeById(ls.weeklyPlan, rs.weeklyPlan);
@@ -1340,6 +1352,7 @@
         {id:uid(),kind:'灵感',title:'把阳台改成小书房',content:'周末量一下尺寸，看能不能放下一张窄桌和一把椅子。',date:today,images:[],sample:true},
         {id:uid(),kind:'日记',title:'今天有点累，但把账理清了',content:'慢慢来，生活不是比赛。',date:shiftDate(-1),images:[],sample:true}
       ],
+      deletedIds:[],
       drafts:{},
       settings:{budget:5000,planLists:['工作','生活','个人成长'],planListFilter:'all',recordsSinceExport:0,moneySinceExport:0,lastExportAt:null,archiveFilter:'all',moneyFilter:'all',plannerFilter:'all',shoppingFilter:'pending',mediaView:'wall',mediaStatusFilter:'all',mediaRatingFilter:0,hiddenHabitKeys:[],brand:{name:'日常集',avatar:'日',tagline:'生活有迹可循',theme:'tju'},fitnessProfile:{height:165,target:55,startWeight:60,age:30,sex:'female',activity:1.375},weeklyPlan:DEFAULT_PLAN.map(x=>({...x}))}
     };
@@ -1354,9 +1367,16 @@
 
   function normalizeState(candidate) {
     if(!candidate||!Array.isArray(candidate.records)) throw new Error('备份格式不正确');
-    const validTypes=new Set(Object.keys(TYPE_META));
-    const validRecords=candidate.records.every(record=>record&&validTypes.has(record.type)&&/^\d{4}-\d{2}-\d{2}$/.test(record.date)&&record.data&&typeof record.data==='object');
-    if(!validRecords) throw new Error('备份中有损坏的记录，请换一份备份重试');
+    const validTypesForRecord=new Set(Object.keys(TYPE_META));
+    function isValidRecord(record){
+      if(!record||!record.type||!validTypesForRecord.has(record.type)) return false;
+      if(!/^\d{4}-\d{2}-\d{2}$/.test(record.date||'')) return false;
+      if(!record.data||typeof record.data!=='object') return false;
+      return true;
+    }
+    const rawRecords=candidate.records;
+    const cleanRecords=rawRecords.filter(isValidRecord);
+    if(cleanRecords.length!==rawRecords.length){ dataCorrupted=true; loadDroppedInvalid+=rawRecords.length-cleanRecords.length; }
     const defaults=makeInitialState();
     const existing=(Array.isArray(candidate.habits)?candidate.habits:[]).map(normalizeHabit);
     const hiddenHabitKeys=new Set(Array.isArray(candidate.settings?.hiddenHabitKeys)?candidate.settings.hiddenHabitKeys:[]);
@@ -1366,11 +1386,12 @@
     });
     const defaultIds=new Set(defaultHabits.map(h=>h.id)),defaultKeys=new Set(HABIT_DEFS.map(h=>h.key));
     const customHabits=existing.filter(h=>!defaultIds.has(h.id)&&!defaultKeys.has(h.key)).map((h,index)=>({...h,key:h.key||`custom-${index}-${uid()}`,type:['check','counter','number'].includes(h.type)?h.type:'check',target:Number(h.target||1),unit:h.unit||'次',entries:h.entries||{},sample:Boolean(h.sample)}));
-    const habits=[...defaultHabits,...customHabits];
-    const shouldRefreshSamples=Number(candidate.version||1)<2&&candidate.records.some(record=>record.sample);
+    const deletedHabitIds=new Set(Array.isArray(candidate.deletedIds)?candidate.deletedIds.filter(x=>typeof x==='string'):[]);
+    const habits=[...defaultHabits,...customHabits].filter(h=>!deletedHabitIds.has(h.id));
+    const shouldRefreshSamples=Number(candidate.version||1)<2&&cleanRecords.some(record=>record.sample);
     const sourceRecords=shouldRefreshSamples
-      ? [...candidate.records.filter(record=>!record.sample),...defaults.records.filter(record=>record.sample)]
-      : candidate.records;
+      ? [...cleanRecords.filter(record=>!record.sample),...defaults.records.filter(record=>record.sample)]
+      : cleanRecords;
     const records=sourceRecords.map(record=>{
       const data={...(record.data||{})};
       if(record.type==='money'){
@@ -1387,6 +1408,7 @@
     const normalizedNotes=(Array.isArray(candidate.notes)?candidate.notes:defaults.notes).filter(n=>n&&(n.title||n.content)).map(n=>({id:n.id||uid(),kind:['灵感','日记','其他'].includes(n.kind)?n.kind:'其他',title:String(n.title||''),content:String(n.content||''),date:/^\d{4}-\d{2}-\d{2}$/.test(n.date||'')?n.date:isoDate(),images:Array.isArray(n.images)?n.images.filter(x=>typeof x==='string'&&x):[],sample:Boolean(n.sample)}));
     return {
       version:2,records,habits,mediaItems,notes:normalizedNotes,
+      deletedIds: Array.isArray(candidate.deletedIds)?candidate.deletedIds.filter(x=>typeof x==='string'):[],
       drafts:candidate.drafts&&typeof candidate.drafts==='object'?candidate.drafts:{},
       settings:(function(){
         const s={...defaults.settings,...(candidate.settings||{})};
@@ -1403,6 +1425,7 @@
   }
 
   let dataCorrupted=false;
+  let loadDroppedInvalid=0;
   function loadState(){
     const raw=localStorage.getItem(STORAGE_KEY);
     if(!raw) return makeInitialState();
@@ -1456,7 +1479,7 @@
     toast('已立即保存');
     return true;
   }
-  function deleteRecord(id){const target=state.records.find(r=>r.id===id);if(!target||!confirm(LANG==='en'?`Delete “${titleFor(target)}”? This cannot be undone.`:`确定删除“${titleFor(target)}”吗？删除后无法撤回。`))return;if(target.remoteId){if(target.type==='money')deleteRemoteMoney(target.remoteId);if(target.type==='planner')deleteRemotePlan(target.remoteId);if(target.type==='fitness')deleteRemoteFitness(target.remoteId);if(target.type==='home')deleteRemoteShopping(target.remoteId);}state.records=state.records.filter(r=>r.id!==id);const saved=saveAfterDelete();renderAll();if(saved)toast('记录已删除');}
+  function deleteRecord(id){const target=state.records.find(r=>r.id===id);if(!target||!confirm(LANG==='en'?`Delete “${titleFor(target)}”? This cannot be undone.`:`确定删除“${titleFor(target)}”吗？删除后无法撤回。`))return;if(target.remoteId){if(target.type==='money')deleteRemoteMoney(target.remoteId);if(target.type==='planner')deleteRemotePlan(target.remoteId);if(target.type==='fitness')deleteRemoteFitness(target.remoteId);if(target.type==='home')deleteRemoteShopping(target.remoteId);}state.records=state.records.filter(r=>r.id!==id);state.deletedIds=state.deletedIds||[];if(!state.deletedIds.includes(id))state.deletedIds.push(id);const saved=saveAfterDelete();renderAll();if(saved)toast('记录已删除');}
   function switchView(view){const target=document.getElementById(`view-${view}`);if(!target)return;document.querySelectorAll('.view').forEach(el=>el.classList.toggle('active',el===target));document.querySelectorAll('[data-nav]').forEach(el=>el.classList.toggle('active',el.dataset.nav===view));const mAct=document.querySelector('.mobile-nav button.active');if(mAct){try{mAct.scrollIntoView({block:'nearest',inline:'center',behavior:'smooth'});}catch(e){}}document.getElementById('viewTitle').textContent=target.dataset.title||'日常集';if(location.hash!==`#${view}`)history.replaceState(null,'',`#${view}`);scrollTo({top:0,behavior:'smooth'});}
   function formatDateHeading(value){if(value===isoDate())return t('今天');if(value===shiftDate(-1))return t('昨天');const date=new Date(`${value}T00:00:00`);return LANG==='en'?new Intl.DateTimeFormat('en-US',{month:'short',day:'numeric'}).format(date):`${date.getMonth()+1} 月 ${date.getDate()} 日`;}
   function titleFor(record){const d=record.data||{},local=value=>record.sample?translateText(value):value;if(record.type==='money')return d.note?local(d.note):t(d.category||'一笔收支');if(record.type==='planner')return d.title?local(d.title):t('一项日程');if(record.type==='fitness')return d.note?local(d.note):t('身体记录');if(record.type==='home')return d.name?local(d.name):t('待买物品');return t('生活记录');}
@@ -1476,7 +1499,7 @@
   function renderDashboard(){
     const today=isoDate(),month=today.slice(0,7);
     const monthExpense=sum(state.records.filter(r=>r.type==='money'&&r.date.startsWith(month)&&r.data.flow==='expense'),r=>r.data.amount);
-    const todayTasks=sortedRecords('planner').filter(r=>r.date===today),doneTasks=todayTasks.filter(r=>r.data.done).length;
+    const todayTasks=sortedRecords('planner').filter(r=>{if(r.data.done)return false;if(r.date===today)return true;return r.date<today&&r.date>=shiftDate(-14);}),doneTasks=todayTasks.filter(r=>r.data.done).length;
     const completed=state.habits.filter(h=>habitDone(h)).length;
     const fitnessToday=state.records.some(r=>r.type==='fitness'&&r.date===today);
     const habitRatio=state.habits.length?completed/state.habits.length:0;
@@ -1855,18 +1878,18 @@
       if(type==='delete')deleteRecord(id);if(type==='toggle-task')toggleTask(id);
       if(type==='habit-plus')updateHabit(id,'plus');if(type==='habit-minus')updateHabit(id,'minus');if(type==='habit-toggle')updateHabit(id,'toggle');if(type==='habit-quick')updateHabit(id,'quick');
       if(type==='toggle-plan'){const item=state.settings.weeklyPlan.find(x=>x.id===id);if(item){item.done=!item.done;const saved=saveState();renderFitness();if(saved&&item.done)celebrate();}}
-      if(type==='delete-habit-custom'){const habit=state.habits.find(h=>h.id===id);if(habit&&confirm(LANG==='en'?`Delete the habit “${habit.name}” and all of its history?`:`确定删除习惯“${habit.name}”吗？历史打卡也会一起删除。`)){state.habits=state.habits.filter(h=>h.id!==id);if(HABIT_DEFS.some(def=>def.key===habit.key)){state.settings.hiddenHabitKeys=[...new Set([...(state.settings.hiddenHabitKeys||[]),habit.key])];}const saved=saveState();renderAll();renderHabitManageList();if(saved)toast('习惯已删除');}}
+      if(type==='delete-habit-custom'){const habit=state.habits.find(h=>h.id===id);if(habit&&confirm(LANG==='en'?`Delete the habit “${habit.name}” and all of its history?`:`确定删除习惯“${habit.name}”吗？历史打卡也会一起删除。`)){state.habits=state.habits.filter(h=>h.id!==id);if(HABIT_DEFS.some(def=>def.key===habit.key)){state.settings.hiddenHabitKeys=[...new Set([...(state.settings.hiddenHabitKeys||[]),habit.key])];}state.deletedIds=state.deletedIds||[];if(!state.deletedIds.includes(id))state.deletedIds.push(id);const saved=saveAfterDelete();renderAll();renderHabitManageList();if(saved)toast('习惯已删除');}}
       if(type==='delete-plan'){const item=state.settings.weeklyPlan.find(x=>x.id===id);if(item&&confirm(LANG==='en'?`Delete the plan “${item.title}”?`:`确定删除计划“${item.title}”吗？`)){state.settings.weeklyPlan=state.settings.weeklyPlan.filter(x=>x.id!==id);const saved=saveAfterDelete();renderFitness();renderPlanManageList();if(saved)toast('计划已删除');}}
       if(type==='toggle-shopping'){const item=state.records.find(r=>r.id===id&&r.type==='home');if(item){item.data.bought=!item.data.bought;item.data.boughtDate=item.data.bought?isoDate():null;updateRemoteShopping(item);const saved=saveState();renderAll();if(saved&&item.data.bought){celebrate();toast('买到了，已移入完成');}}}
-      if(type==='delete-media'){const item=state.mediaItems.find(media=>media.id===id);if(item&&confirm(LANG==='en'?`Remove “${item.name}” from the list?`:`确定从清单中删除“${item.name}”吗？`)){if(item.remoteId)deleteRemoteMedia(item.remoteId);state.mediaItems=state.mediaItems.filter(media=>media.id!==id);const saved=saveAfterDelete();renderMedia();if(saved)toast('已从书影音清单移除');}}
+      if(type==='delete-media'){const item=state.mediaItems.find(media=>media.id===id);if(item&&confirm(LANG==='en'?`Remove “${item.name}” from the list?`:`确定从清单中删除“${item.name}”吗？`)){if(item.remoteId)deleteRemoteMedia(item.remoteId);state.mediaItems=state.mediaItems.filter(media=>media.id!==id);state.deletedIds=state.deletedIds||[];if(!state.deletedIds.includes(id))state.deletedIds.push(id);const saved=saveAfterDelete();renderMedia();if(saved)toast('已从书影音清单移除');}}
       if(type==='close-media-edit')closeMediaEdit();
       if(type==='edit-record')openRecordEdit(id);
       if(type==='close-record-edit')closeRecordEdit();
       if(type==='open-brand-from-cloud'){closeCloudSettings();openBrandSettings();}
       if(type==='close-install-help'){var ih=document.getElementById('installHelp');if(ih)ih.hidden=true;}
-      if(type==='delete-media-edit'){const item=state.mediaItems.find(m=>m.id===editingMediaId);if(item&&confirm(LANG==='en'?`Remove “${item.name}” from the list?`:`确定从清单中删除“${item.name}”吗？`)){if(item.remoteId)deleteRemoteMedia(item.remoteId);state.mediaItems=state.mediaItems.filter(m=>m.id!==item.id);const saved=saveAfterDelete();closeMediaEdit();renderMedia();if(saved)toast('已从书影音清单移除');}}
+      if(type==='delete-media-edit'){const item=state.mediaItems.find(m=>m.id===editingMediaId);if(item&&confirm(LANG==='en'?`Remove “${item.name}” from the list?`:`确定从清单中删除“${item.name}”吗？`)){if(item.remoteId)deleteRemoteMedia(item.remoteId);state.mediaItems=state.mediaItems.filter(m=>m.id!==item.id);state.deletedIds=state.deletedIds||[];if(!state.deletedIds.includes(item.id))state.deletedIds.push(item.id);const saved=saveAfterDelete();closeMediaEdit();renderMedia();if(saved)toast('已从书影音清单移除');}}
       if(type==='open-habit-settings')openHabitSettings();if(type==='close-habit-settings')closeHabitSettings();if(type==='open-plan-settings')openPlanSettings();if(type==='close-plan-settings')closePlanSettings();if(type==='open-fitness-profile')openFitnessProfile();if(type==='close-fitness-profile')closeFitnessProfile();
-      if(type==='export-money')exportExcel('money');if(type==='export-fitness')exportExcel('fitness');if(type==='delete-note'){var note=state.notes.find(n=>n.id===id);if(note&&confirm('确定删除这条记录吗？')){if(note.remoteId)deleteRemoteNotes(note.remoteId);state.notes=state.notes.filter(n=>n.id!==id);var saved=saveState();renderNotes();if(saved)toast('已删除');}}if(type==='export-notes-word')exportNotesWord();if(type==='remove-note-image'){var ri=Number(action.dataset.i);if(!isNaN(ri)&&pendingNoteImages[ri]){pendingNoteImages.splice(ri,1);renderNoteThumbs();}}if(type==='toggle-habit-month'){const p=document.getElementById('habitMonthPanel');p.hidden=!p.hidden;if(!p.hidden)renderHabitMonth();}if(type==='export-excel'&&action.dataset.kind==='habit')habitExportExcel();if(type==='habit-month-prev'){habitMonthCursor=shiftMonth(habitMonthCursor,-1);renderHabitMonth();}if(type==='habit-month-next'){habitMonthCursor=shiftMonth(habitMonthCursor,1);renderHabitMonth();}if(type==='exercise-month-prev'){exerciseMonthCursor=shiftMonth(exerciseMonthCursor,-1);renderExerciseMonth();}if(type==='exercise-month-next'){exerciseMonthCursor=shiftMonth(exerciseMonthCursor,1);renderExerciseMonth();}if(type==='planner-month-prev'){plannerMonthCursor=shiftMonth(plannerMonthCursor,-1);renderPlannerMonth();}if(type==='planner-month-next'){plannerMonthCursor=shiftMonth(plannerMonthCursor,1);renderPlannerMonth();}if(type==='habit-timer-toggle')toggleHabitTimer(id);if(type==='close-brand')closeBrandSettings();if(type==='reset-brand'){state.settings.brand={name:'日常集',avatar:'日',tagline:'生活有迹可循',theme:'plum'};saveState();applyBrand();openBrandSettings();toast('已恢复默认外观');}
+      if(type==='export-money')exportExcel('money');if(type==='export-fitness')exportExcel('fitness');if(type==='delete-note'){var note=state.notes.find(n=>n.id===id);if(note&&confirm('确定删除这条记录吗？')){if(note.remoteId)deleteRemoteNotes(note.remoteId);state.notes=state.notes.filter(n=>n.id!==id);state.deletedIds=state.deletedIds||[];if(!state.deletedIds.includes(id))state.deletedIds.push(id);var saved=saveAfterDelete();renderNotes();if(saved)toast('已删除');}}if(type==='export-notes-word')exportNotesWord();if(type==='remove-note-image'){var ri=Number(action.dataset.i);if(!isNaN(ri)&&pendingNoteImages[ri]){pendingNoteImages.splice(ri,1);renderNoteThumbs();}}if(type==='toggle-habit-month'){const p=document.getElementById('habitMonthPanel');p.hidden=!p.hidden;if(!p.hidden)renderHabitMonth();}if(type==='export-excel'&&action.dataset.kind==='habit')habitExportExcel();if(type==='habit-month-prev'){habitMonthCursor=shiftMonth(habitMonthCursor,-1);renderHabitMonth();}if(type==='habit-month-next'){habitMonthCursor=shiftMonth(habitMonthCursor,1);renderHabitMonth();}if(type==='exercise-month-prev'){exerciseMonthCursor=shiftMonth(exerciseMonthCursor,-1);renderExerciseMonth();}if(type==='exercise-month-next'){exerciseMonthCursor=shiftMonth(exerciseMonthCursor,1);renderExerciseMonth();}if(type==='planner-month-prev'){plannerMonthCursor=shiftMonth(plannerMonthCursor,-1);renderPlannerMonth();}if(type==='planner-month-next'){plannerMonthCursor=shiftMonth(plannerMonthCursor,1);renderPlannerMonth();}if(type==='habit-timer-toggle')toggleHabitTimer(id);if(type==='close-brand')closeBrandSettings();if(type==='reset-brand'){state.settings.brand={name:'日常集',avatar:'日',tagline:'生活有迹可循',theme:'plum'};saveState();applyBrand();openBrandSettings();toast('已恢复默认外观');}
     });
     document.addEventListener('change',event=>{if(event.target.dataset.action==='habit-number')updateHabit(event.target.dataset.id,'number',event.target.value);if(event.target.dataset.action==='habit-sleep')setSleepTime(event.target.dataset.id,event.target.dataset.part,event.target.value);});
     var budgetInputEl=document.getElementById('budgetInput');
@@ -1884,7 +1907,7 @@
     document.querySelectorAll('[data-media-view]').forEach(button=>button.addEventListener('click',()=>{state.settings.mediaView=button.dataset.mediaView;saveState();renderMedia();}));
     document.getElementById('mediaStatusFilter').addEventListener('change',e=>{state.settings.mediaStatusFilter=e.target.value;saveState();renderMedia();});
     document.getElementById('mediaRatingFilter').addEventListener('change',e=>{state.settings.mediaRatingFilter=Number(e.target.value);saveState();renderMedia();});
-    document.getElementById('clearSamplesBtn').addEventListener('click',()=>{const recordSamples=state.records.filter(r=>r.sample).length,mediaSamples=state.mediaItems.filter(item=>item.sample).length,habitSamples=state.habits.filter(h=>h.sample).length,noteSamples=state.notes.filter(n=>n.sample).length,sampleCount=recordSamples+mediaSamples+habitSamples+noteSamples;if(!sampleCount)return;if(!confirm(`将清空 ${sampleCount} 条示例记录和示例打卡，你自己的内容会保留。是否继续？`))return;state.records=state.records.filter(r=>!r.sample);state.mediaItems=state.mediaItems.filter(item=>!item.sample);state.notes=state.notes.filter(n=>!n.sample);state.habits.forEach(h=>{if(h.sample){h.entries={};h.sample=false;}});state.settings.weeklyPlan=DEFAULT_PLAN.map(x=>({...x}));const saved=saveAfterDelete();renderAll();if(saved)toast('示例内容已清空');});
+    document.getElementById('clearSamplesBtn').addEventListener('click',()=>{const recordSamples=state.records.filter(r=>r.sample).length,mediaSamples=state.mediaItems.filter(item=>item.sample).length,habitSamples=state.habits.filter(h=>h.sample).length,noteSamples=state.notes.filter(n=>n.sample).length,sampleCount=recordSamples+mediaSamples+habitSamples+noteSamples;if(!sampleCount)return;if(!confirm(`将清空 ${sampleCount} 条示例记录和示例打卡，你自己的内容会保留。是否继续？`))return;const sampleIds=[];state.records.forEach(r=>{if(r.sample)sampleIds.push(r.id);});state.mediaItems.forEach(m=>{if(m.sample)sampleIds.push(m.id);});state.notes.forEach(n=>{if(n.sample)sampleIds.push(n.id);});state.deletedIds=state.deletedIds||[];sampleIds.forEach(x=>{if(!state.deletedIds.includes(x))state.deletedIds.push(x);});state.records=state.records.filter(r=>!r.sample);state.mediaItems=state.mediaItems.filter(item=>!item.sample);state.notes=state.notes.filter(n=>!n.sample);state.habits.forEach(h=>{if(h.sample){h.entries={};h.sample=false;}});state.settings.weeklyPlan=DEFAULT_PLAN.map(x=>({...x}));const saved=saveAfterDelete();renderAll();if(saved)toast('示例内容已清空');});
     window.addEventListener('storage',e=>{if(e.key!==STORAGE_KEY||!e.newValue)return;try{state=normalizeState(JSON.parse(e.newValue));renderAll();toast('另一个页面的数据已同步');}catch{}});
   }
 
@@ -2471,7 +2494,7 @@
     });
   }
 
-  function init(){try{sbApplyHashCfg();}catch(e){}const now=new Date(),weekdays=['星期日','星期一','星期二','星期三','星期四','星期五','星期六'];document.getElementById('todayLabel').textContent=LANG==='en'?new Intl.DateTimeFormat('en-US',{month:'long',day:'numeric',weekday:'long'}).format(now):`${now.getMonth()+1} 月 ${now.getDate()} 日 · ${weekdays[now.getDay()]}`;setDateDefaults();updateMoneyCategories();restoreDrafts();bindForms();bindEvents();renderAll();switchView(document.getElementById(`view-${location.hash.slice(1)}`)?location.hash.slice(1):'dashboard');if(!dataCorrupted)saveStateLocal();bindCloudEvents();bindAuthEvents();renderPlanListSelect();mountCloudCard();updateAuthAccount();bootAuth(function(){ startSync(); sbAutoRefresh(); });}
+  function init(){try{sbApplyHashCfg();}catch(e){}const now=new Date(),weekdays=['星期日','星期一','星期二','星期三','星期四','星期五','星期六'];document.getElementById('todayLabel').textContent=LANG==='en'?new Intl.DateTimeFormat('en-US',{month:'long',day:'numeric',weekday:'long'}).format(now):`${now.getMonth()+1} 月 ${now.getDate()} 日 · ${weekdays[now.getDay()]}`;setDateDefaults();updateMoneyCategories();restoreDrafts();bindForms();bindEvents();renderAll();switchView(document.getElementById(`view-${location.hash.slice(1)}`)?location.hash.slice(1):'dashboard');if(!dataCorrupted)saveStateLocal();if(loadDroppedInvalid>0)toast('检测到 '+loadDroppedInvalid+' 条损坏记录已自动跳过，其余数据正常');bindCloudEvents();bindAuthEvents();renderPlanListSelect();mountCloudCard();updateAuthAccount();bootAuth(function(){ startSync(); sbAutoRefresh(); });}
   startI18n();
   document.addEventListener('DOMContentLoaded',init);
   // 页面起来 1.5 秒后探一次站点可达性（沙箱休眠时给出「缓存模式，数据没丢」的提示）
